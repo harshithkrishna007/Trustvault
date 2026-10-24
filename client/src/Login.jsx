@@ -3,7 +3,8 @@
 import { useState } from "react";
 import "./Login.css";
 
-const API_URL = "/api";
+const API_URL =
+  (import.meta.env.VITE_API_URL || "").replace(/\/+$/, "") + "/api";
 
 export default function Login() {
   const [email, setEmail] = useState("");
