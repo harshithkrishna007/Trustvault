@@ -2,7 +2,7 @@
 import "dotenv/config";
 import bcrypt from "bcryptjs";
 import { randomUUID } from "node:crypto";
-import { db } from "./db.js";
+import { pool } from "./postgres.js";
 
 const demoUsers = [
   ["TrustVault Admin", "admin@trustvault.demo", process.env.DEMO_ADMIN_PASSWORD, "admin"],
@@ -19,6 +19,7 @@ try {
     }
 
     prepared.push({
+      id: randomUUID(),
       name,
       email,
       role,
@@ -26,44 +27,44 @@ try {
     });
   }
 
-  const insert = db.prepare(`
-    INSERT INTO users (id, name, email, password_hash, role)
-    VALUES (?, ?, ?, ?, ?)
-  `);
+  const client = await pool.connect();
 
-  const update = db.prepare(`
-    UPDATE users
-    SET name = ?, password_hash = ?, role = ?, disabled = 0
-    WHERE email = ?
-  `);
+  try {
+    await client.query("BEGIN");
 
-  const seed = db.transaction((users) => {
-    for (const user of users) {
-      const existing = db.prepare(
-        "SELECT id FROM users WHERE email = ?"
-      ).get(user.email);
+    for (const user of prepared) {
+      const existing = await client.query(
+        "SELECT id FROM users WHERE email = $1",
+        [user.email]
+      );
 
-      if (existing) {
-        update.run(
-          user.name, user.passwordHash, user.role, user.email
+      if (existing.rowCount > 0) {
+        await client.query(
+          `UPDATE users
+           SET name = $1, password_hash = $2, role = $3, disabled = FALSE
+           WHERE email = $4`,
+          [user.name, user.passwordHash, user.role, user.email]
         );
       } else {
-        insert.run(
-          randomUUID(),
-          user.name,
-          user.email,
-          user.passwordHash,
-          user.role
+        await client.query(
+          `INSERT INTO users (id, name, email, password_hash, role)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [user.id, user.name, user.email, user.passwordHash, user.role]
         );
       }
     }
-  });
 
-  seed(prepared);
-  console.log("TrustVault demo users seeded successfully.");
+    await client.query("COMMIT");
+    console.log("TrustVault demo users seeded successfully.");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 } catch (error) {
   console.error("Failed to seed demo users:", error.message);
   process.exitCode = 1;
 } finally {
-  db.close();
+  await pool.end();
 }

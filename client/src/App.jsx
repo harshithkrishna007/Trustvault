@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from "react";
 import {
   getDocuments,
@@ -14,7 +13,7 @@ import {
 } from "./api";
 import "./App.css";
 
-const API_URL = "http://localhost:4000/api";
+const API_URL = "/api";
 
 function App() {
   const [user, setUser] = useState(null);
@@ -46,11 +45,43 @@ function App() {
   const isAdmin =
     String(user?.role || "").toLowerCase() === "admin";
 
+  const safeDocuments = Array.isArray(documents) ? documents : [];
+  const safeUsers = Array.isArray(users) ? users : [];
+  const safeGrants = Array.isArray(grants) ? grants : [];
+  const safeAuditLogs = Array.isArray(auditLogs) ? auditLogs : [];
+
+  const filteredDocuments = safeDocuments.filter((document) => {
+    const query = search.trim().toLowerCase();
+
+    return (
+      String(document.name || "").toLowerCase().includes(query) ||
+      String(document.category || "").toLowerCase().includes(query)
+    );
+  });
+
+  const totalSize = safeDocuments.reduce(
+    (total, document) => total + (Number(document.size) || 0),
+    0
+  );
+
+  const manageableDocuments = safeDocuments.filter(
+    (document) =>
+      user &&
+      (isAdmin ||
+        String(user.role || "").toLowerCase() === "owner" ||
+        String(document.owner_id ?? document.ownerId) ===
+          String(user.id))
+  );
+
+  const availableUsers = safeUsers.filter(
+    (item) => String(item.id) !== String(user?.id)
+  );
+
   function handleReturnToLogin() {
     window.location.assign("/login");
   }
 
-  // Verify the current session and load documents.
+  // Check the authenticated session and load documents.
   useEffect(() => {
     let active = true;
 
@@ -82,13 +113,20 @@ function App() {
 
         const result = await getDocuments();
 
-        if (active) {
-          setDocuments(result);
+        if (!active) return;
+
+        if (!Array.isArray(result)) {
+          throw new Error(
+            "The documents API returned an unexpected response."
+          );
         }
-      } catch {
+
+        setDocuments(result);
+      } catch (err) {
         if (active) {
           setError(
-            "Cannot connect to TrustVault. Check that the backend is running."
+            err.message ||
+              "Cannot connect to TrustVault. Check that the backend is running."
           );
         }
       } finally {
@@ -108,38 +146,68 @@ function App() {
   const loadDocuments = useCallback(async () => {
     try {
       setError("");
+
       const result = await getDocuments();
+
+      if (!Array.isArray(result)) {
+        throw new Error(
+          "The documents API returned an unexpected response."
+        );
+      }
+
       setDocuments(result);
     } catch (err) {
       setError(err.message || "Could not load documents.");
     }
   }, []);
 
-  // Load users when Sharing opens.
+  // Load the user directory whenever the Sharing view opens.
   useEffect(() => {
     if (activeView !== "Sharing" || !user) return;
 
-    let active = true;
+    let cancelled = false;
 
     async function loadSharingUsers() {
+      setLoadingUsers(true);
+
       try {
-        setLoadingUsers(true);
         const result = await getUsers();
 
-        if (active) setUsers(result);
+        if (!Array.isArray(result)) {
+          throw new Error(
+            "The users API returned an unexpected response."
+          );
+        }
+
+        if (!cancelled) {
+          setUsers(result);
+          setSelectedUserId((currentId) => {
+            const stillAvailable = result.some(
+              (item) =>
+                String(item.id) === String(currentId) &&
+                String(item.id) !== String(user.id)
+            );
+
+            return stillAvailable ? currentId : "";
+          });
+        }
       } catch (err) {
-        if (active) {
+        if (!cancelled) {
+          setUsers([]);
+          setSelectedUserId("");
           setError(err.message || "Could not load users.");
         }
       } finally {
-        if (active) setLoadingUsers(false);
+        if (!cancelled) {
+          setLoadingUsers(false);
+        }
       }
     }
 
     loadSharingUsers();
 
     return () => {
-      active = false;
+      cancelled = true;
     };
   }, [activeView, user]);
 
@@ -151,8 +219,10 @@ function App() {
 
     try {
       setLoadingGrants(true);
+
       const result = await getDocumentGrants(documentId);
-      setGrants(result);
+
+      setGrants(Array.isArray(result) ? result : []);
     } catch (err) {
       setGrants([]);
       setError(
@@ -164,20 +234,21 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (activeView === "Sharing" && selectedDocumentId && user) {
+    if (
+      activeView === "Sharing" &&
+      selectedDocumentId &&
+      user
+    ) {
       loadGrants(selectedDocumentId);
     } else if (!selectedDocumentId) {
       setGrants([]);
     }
   }, [activeView, selectedDocumentId, user, loadGrants]);
 
-  // Load real audit records through client/src/api.js.
   const loadAuditLogs = useCallback(async () => {
     if (!isAdmin) {
       setAuditLogs([]);
-      setAuditError(
-        "Only administrators can view audit logs."
-      );
+      setAuditError("Only administrators can view audit logs.");
       return;
     }
 
@@ -185,15 +256,15 @@ function App() {
       setLoadingAudit(true);
       setAuditError("");
 
-      const logs = await getAuditLogs();
+      const result = await getAuditLogs();
 
-      if (!Array.isArray(logs)) {
+      if (!Array.isArray(result)) {
         throw new Error(
           "The audit API returned an unexpected response."
         );
       }
 
-      setAuditLogs(logs);
+      setAuditLogs(result);
     } catch (err) {
       setAuditError(
         err.message || "Could not load audit logs."
@@ -203,15 +274,12 @@ function App() {
     }
   }, [isAdmin]);
 
-  // Load audit logs only when the Activity view opens.
   useEffect(() => {
     if (activeView !== "Activity" || !user) return;
 
     if (!isAdmin) {
       setAuditLogs([]);
-      setAuditError(
-        "Only administrators can view audit logs."
-      );
+      setAuditError("Only administrators can view audit logs.");
       return;
     }
 
@@ -222,7 +290,7 @@ function App() {
     event.preventDefault();
 
     const form = event.currentTarget;
-    const file = form.elements.file.files[0];
+    const file = form.elements.file?.files?.[0];
 
     if (!file) {
       setError("Please choose a file to upload.");
@@ -281,6 +349,7 @@ function App() {
       await renameDocument(document.id, name.trim());
 
       setMessage("Document renamed successfully.");
+
       await loadDocuments();
     } catch (err) {
       setError(err.message || "Rename failed.");
@@ -288,11 +357,13 @@ function App() {
   }
 
   async function handleDelete(document) {
-    const confirmed = window.confirm(
-      `Are you sure you want to delete "${document.name}"?`
-    );
-
-    if (!confirmed) return;
+    if (
+      !window.confirm(
+        `Are you sure you want to delete "${document.name}"?`
+      )
+    ) {
+      return;
+    }
 
     try {
       setError("");
@@ -300,14 +371,13 @@ function App() {
 
       await deleteDocument(document.id);
 
-      if (
-        String(selectedDocumentId) === String(document.id)
-      ) {
+      if (String(selectedDocumentId) === String(document.id)) {
         setSelectedDocumentId("");
         setGrants([]);
       }
 
       setMessage("Document deleted successfully.");
+
       await loadDocuments();
     } catch (err) {
       setError(err.message || "Delete failed.");
@@ -328,13 +398,7 @@ function App() {
       });
 
       if (!response.ok) {
-        let data = {};
-
-        try {
-          data = await response.json();
-        } catch {
-          // The server may return an empty response.
-        }
+        const data = await response.json().catch(() => ({}));
 
         setError(
           data.error ||
@@ -351,7 +415,6 @@ function App() {
       setAuditLogs([]);
       setSelectedDocumentId("");
       setSelectedUserId("");
-      setActiveView("Overview");
 
       window.location.assign("/login");
     } catch {
@@ -371,9 +434,21 @@ function App() {
       return;
     }
 
-    const existingGrant = grants.find(
+    if (
+      !availableUsers.some(
+        (item) => String(item.id) === String(selectedUserId)
+      )
+    ) {
+      setError(
+        "The selected user is no longer available. Refresh the user list."
+      );
+      return;
+    }
+
+    const existingGrant = safeGrants.find(
       (grant) =>
-        String(grant.userId) === String(selectedUserId)
+        String(grant.userId ?? grant.user_id) ===
+        String(selectedUserId)
     );
 
     if (existingGrant) {
@@ -394,9 +469,8 @@ function App() {
         permission
       );
 
-      const selectedUser = users.find(
-        (item) =>
-          String(item.id) === String(selectedUserId)
+      const selectedUser = availableUsers.find(
+        (item) => String(item.id) === String(selectedUserId)
       );
 
       setMessage(
@@ -416,14 +490,16 @@ function App() {
   async function handlePermissionChange(grant, newPermission) {
     if (grant.permission === newPermission) return;
 
+    const grantUserId = grant.userId ?? grant.user_id;
+
     try {
-      setChangingGrantUserId(String(grant.userId));
+      setChangingGrantUserId(String(grantUserId));
       setError("");
       setMessage("");
 
       await grantDocumentAccess(
         selectedDocumentId,
-        grant.userId,
+        grantUserId,
         newPermission
       );
 
@@ -442,58 +518,38 @@ function App() {
   }
 
   async function handleRevoke(grant) {
-    const confirmed = window.confirm(
-      `Revoke ${grant.name}'s access to this document?`
-    );
+    const grantUserId = grant.userId ?? grant.user_id;
+    const grantName = grant.name || grant.email || "this user";
 
-    if (!confirmed) return;
+    if (
+      !window.confirm(
+        `Revoke ${grantName}'s access to this document?`
+      )
+    ) {
+      return;
+    }
 
     try {
-      setRevokingUserId(String(grant.userId));
+      setRevokingUserId(String(grantUserId));
       setError("");
       setMessage("");
 
       await revokeDocumentAccess(
         selectedDocumentId,
-        grant.userId
+        grantUserId
       );
 
-      setMessage(`Access revoked for ${grant.name}.`);
+      setMessage(`Access revoked for ${grantName}.`);
 
       await loadGrants(selectedDocumentId);
     } catch (err) {
       setError(
-        err.message || "Could not revoke access."
+        err.message || "Could not revoke document access."
       );
     } finally {
       setRevokingUserId("");
     }
   }
-
-  const filteredDocuments = documents.filter((document) => {
-    const query = search.trim().toLowerCase();
-
-    return (
-      document.name?.toLowerCase().includes(query) ||
-      document.category?.toLowerCase().includes(query)
-    );
-  });
-
-  const totalSize = documents.reduce(
-    (total, document) =>
-      total + (Number(document.size) || 0),
-    0
-  );
-
-  const manageableDocuments = documents.filter(
-    (document) =>
-      user &&
-      (
-        user.role === "owner" ||
-        isAdmin ||
-        String(document.owner_id) === String(user.id)
-      )
-  );
 
   if (loading) {
     return (
@@ -513,7 +569,6 @@ function App() {
         <section className="fallback-card">
           <span className="brand-icon">T</span>
           <h1>TrustVault</h1>
-
           <p>
             {loggingOut
               ? "Logging out securely..."
@@ -552,6 +607,7 @@ function App() {
 
         <nav className="sidebar-nav" aria-label="Main navigation">
           <button
+            type="button"
             className={
               activeView === "Overview"
                 ? "nav-item active"
@@ -564,6 +620,7 @@ function App() {
           </button>
 
           <button
+            type="button"
             className={
               activeView === "Documents"
                 ? "nav-item active"
@@ -574,11 +631,12 @@ function App() {
             <span className="nav-icon">▤</span>
             My documents
             <span className="nav-count">
-              {documents.length}
+              {safeDocuments.length}
             </span>
           </button>
 
           <button
+            type="button"
             className={
               activeView === "Sharing"
                 ? "nav-item active"
@@ -595,6 +653,7 @@ function App() {
           </button>
 
           <button
+            type="button"
             className={
               activeView === "Activity"
                 ? "nav-item active"
@@ -650,9 +709,11 @@ function App() {
             <div className="topbar-security">
               <span>●</span> Secure session
             </div>
+
             <div className="avatar">
               {(user.name || "U").charAt(0).toUpperCase()}
             </div>
+
             <div className="topbar-user">
               <strong>{user.name}</strong>
               <span>{user.role}</span>
@@ -662,7 +723,7 @@ function App() {
 
         <div className="page-content">
           {error && (
-            <div className="notice error-message">
+            <div className="notice error-message" role="alert">
               <span>!</span> {error}
               <button
                 type="button"
@@ -675,7 +736,7 @@ function App() {
           )}
 
           {message && (
-            <div className="notice success-message">
+            <div className="notice success-message" role="status">
               <span>✓</span> {message}
               <button
                 type="button"
@@ -695,13 +756,15 @@ function App() {
                     <span className="eyebrow-dot" />
                     YOUR PRIVATE WORKSPACE
                   </div>
+
                   <h1>
                     Good to see you,{" "}
                     {user.name?.split(" ")[0] || "there"}.
                   </h1>
+
                   <p>
-                    Manage your files and keep your important documents in one
-                    secure place.
+                    Manage your files and keep your important documents
+                    in one secure place.
                   </p>
                 </div>
 
@@ -723,7 +786,7 @@ function App() {
                     <span className="stat-icon purple">▤</span>
                   </div>
                   <div className="stat-value">
-                    {documents.length}
+                    {safeDocuments.length}
                   </div>
                   <div className="stat-caption">
                     Files you can access
@@ -808,9 +871,7 @@ function App() {
                     type="submit"
                     disabled={uploading}
                   >
-                    {uploading
-                      ? "Uploading..."
-                      : "↑  Upload document"}
+                    {uploading ? "Uploading..." : "↑ Upload document"}
                   </button>
                 </form>
               </section>
@@ -821,6 +882,7 @@ function App() {
                     <h2>Recent documents</h2>
                     <p>Quick access to your available files.</p>
                   </div>
+
                   <button
                     type="button"
                     className="text-button"
@@ -831,7 +893,7 @@ function App() {
                 </div>
 
                 <DocumentList
-                  documents={documents.slice(0, 4)}
+                  documents={safeDocuments.slice(0, 4)}
                   user={user}
                   onDownload={handleDownload}
                   onRename={handleRename}
@@ -849,11 +911,13 @@ function App() {
                     <span className="eyebrow-dot" />
                     FILE MANAGEMENT
                   </div>
+
                   <h1>My documents</h1>
                   <p>
                     Find and manage the documents available to your account.
                   </p>
                 </div>
+
                 <button
                   type="button"
                   className="secondary-button"
@@ -867,14 +931,19 @@ function App() {
                 <div className="section-heading document-toolbar">
                   <div>
                     <h2>All documents</h2>
-                    <p>{documents.length} files available</p>
+                    <p>
+                      {safeDocuments.length} files available
+                    </p>
                   </div>
+
                   <input
                     className="search-input"
                     type="search"
                     placeholder="Search documents..."
                     value={search}
-                    onChange={(event) => setSearch(event.target.value)}
+                    onChange={(event) =>
+                      setSearch(event.target.value)
+                    }
                   />
                 </div>
 
@@ -897,12 +966,44 @@ function App() {
                     <span className="eyebrow-dot" />
                     ACCESS CONTROL
                   </div>
+
                   <h1>Sharing permissions</h1>
                   <p>
-                    Give other active users controlled access to documents you
-                    own, and review or revoke existing permissions.
+                    Manage access to documents you own and review existing
+                    permissions.
                   </p>
                 </div>
+
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    setError("");
+                    setActiveView("Sharing");
+                    // Re-entering the view is not needed to reload;
+                    // the explicit reload below handles refresh.
+                    setLoadingUsers(true);
+                    getUsers()
+                      .then((result) => {
+                        if (!Array.isArray(result)) {
+                          throw new Error(
+                            "The users API returned an unexpected response."
+                          );
+                        }
+                        setUsers(result);
+                      })
+                      .catch((err) => {
+                        setUsers([]);
+                        setError(
+                          err.message || "Could not load users."
+                        );
+                      })
+                      .finally(() => setLoadingUsers(false));
+                  }}
+                  disabled={loadingUsers}
+                >
+                  {loadingUsers ? "Loading users..." : "↻ Refresh users"}
+                </button>
               </section>
 
               <section className="panel sharing-panel">
@@ -939,10 +1040,7 @@ function App() {
                       >
                         <option value="">Select a document</option>
                         {manageableDocuments.map((document) => (
-                          <option
-                            key={document.id}
-                            value={document.id}
-                          >
+                          <option key={document.id} value={document.id}>
                             {document.name}
                           </option>
                         ))}
@@ -957,19 +1055,30 @@ function App() {
                           setSelectedUserId(event.target.value)
                         }
                         required
-                        disabled={loadingUsers}
+                        disabled={loadingUsers || availableUsers.length === 0}
                       >
                         <option value="">
                           {loadingUsers
                             ? "Loading users..."
-                            : "Select a user"}
+                            : availableUsers.length === 0
+                              ? "No other users available"
+                              : "Select a user"}
                         </option>
-                        {users.map((item) => (
+
+                        {availableUsers.map((item) => (
                           <option key={item.id} value={item.id}>
-                            {item.name} ({item.email})
+                            {item.name || "Unnamed user"}
+                            {item.email ? ` (${item.email})` : ""}
                           </option>
                         ))}
                       </select>
+
+                      {!loadingUsers && availableUsers.length === 0 && (
+                        <small>
+                          No other users were returned by the users API.
+                          Use Refresh users to try again.
+                        </small>
+                      )}
                     </label>
 
                     <label className="category-field">
@@ -996,12 +1105,14 @@ function App() {
                         savingGrant ||
                         loadingUsers ||
                         !selectedDocumentId ||
-                        !selectedUserId
+                        !selectedUserId ||
+                        !availableUsers.some(
+                          (item) =>
+                            String(item.id) === String(selectedUserId)
+                        )
                       }
                     >
-                      {savingGrant
-                        ? "Saving..."
-                        : "＋ Grant access"}
+                      {savingGrant ? "Saving..." : "＋ Grant access"}
                     </button>
                   </form>
                 )}
@@ -1042,7 +1153,7 @@ function App() {
                   <div className="empty-state">
                     <p>Loading permissions...</p>
                   </div>
-                ) : grants.length === 0 ? (
+                ) : safeGrants.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-icon">♙</div>
                     <h3>No shared users yet</h3>
@@ -1050,74 +1161,81 @@ function App() {
                   </div>
                 ) : (
                   <div className="grant-list">
-                    {grants.map((grant) => (
-                      <article
-                        className="document-row grant-row"
-                        key={grant.userId}
-                      >
-                        <div className="avatar grant-avatar">
-                          {(grant.name || "U").charAt(0).toUpperCase()}
-                        </div>
+                    {safeGrants.map((grant, index) => {
+                      const grantUserId =
+                        grant.userId ?? grant.user_id;
+                      const grantName =
+                        grant.name || grant.email || "User";
+                      const grantPermission =
+                        grant.permission || "read";
+                      const grantCreatedAt =
+                        grant.createdAt ?? grant.created_at;
 
-                        <div className="document-info grant-info">
-                          <h3>{grant.name}</h3>
-                          <p>{grant.email}</p>
-                          <small>
-                            Granted{" "}
-                            {grant.createdAt
-                              ? new Date(
-                                  grant.createdAt
-                                ).toLocaleDateString()
-                              : "previously"}
-                          </small>
-                        </div>
+                      return (
+                        <article
+                          className="document-row grant-row"
+                          key={grantUserId ?? index}
+                        >
+                          <div className="avatar grant-avatar">
+                            {grantName.charAt(0).toUpperCase()}
+                          </div>
 
-                        <div className="grant-controls">
-                          <label className="grant-permission">
-                            <span className="sr-only">
-                              Permission for {grant.name}
-                            </span>
-                            <select
-                              value={grant.permission}
+                          <div className="document-info grant-info">
+                            <h3>{grantName}</h3>
+                            <p>{grant.email}</p>
+                            <small>
+                              Granted{" "}
+                              {grantCreatedAt
+                                ? new Date(
+                                    grantCreatedAt
+                                  ).toLocaleDateString()
+                                : "previously"}
+                            </small>
+                          </div>
+
+                          <div className="grant-controls">
+                            <label className="grant-permission">
+                              <span className="sr-only">
+                                Permission for {grantName}
+                              </span>
+                              <select
+                                value={grantPermission}
+                                disabled={
+                                  changingGrantUserId ===
+                                    String(grantUserId) ||
+                                  revokingUserId === String(grantUserId)
+                                }
+                                onChange={(event) =>
+                                  handlePermissionChange(
+                                    grant,
+                                    event.target.value
+                                  )
+                                }
+                              >
+                                <option value="read">Read</option>
+                                <option value="edit">Edit</option>
+                              </select>
+                            </label>
+
+                            <button
+                              type="button"
+                              className="icon-button delete-icon"
+                              title={`Revoke ${grantName}'s access`}
+                              aria-label={`Revoke access for ${grantName}`}
                               disabled={
-                                changingGrantUserId ===
-                                  String(grant.userId) ||
-                                revokingUserId ===
-                                  String(grant.userId)
+                                revokingUserId === String(grantUserId) ||
+                                changingGrantUserId === String(grantUserId)
                               }
-                              onChange={(event) =>
-                                handlePermissionChange(
-                                  grant,
-                                  event.target.value
-                                )
-                              }
+                              onClick={() => handleRevoke(grant)}
                             >
-                              <option value="read">Read</option>
-                              <option value="edit">Edit</option>
-                            </select>
-                          </label>
-
-                          <button
-                            type="button"
-                            className="icon-button delete-icon"
-                            title={`Revoke ${grant.name}'s access`}
-                            aria-label={`Revoke access for ${grant.name}`}
-                            disabled={
-                              revokingUserId ===
-                                String(grant.userId) ||
-                              changingGrantUserId ===
-                                String(grant.userId)
-                            }
-                            onClick={() => handleRevoke(grant)}
-                          >
-                            {revokingUserId ===
-                            String(grant.userId)
-                              ? "…"
-                              : "×"}
-                          </button>
-                        </div>
-                      </article>
-                    ))}
+                              {revokingUserId === String(grantUserId)
+                                ? "…"
+                                : "×"}
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
                   </div>
                 )}
               </section>
@@ -1132,6 +1250,7 @@ function App() {
                     <span className="eyebrow-dot" />
                     SECURITY MONITORING
                   </div>
+
                   <h1>Audit activity</h1>
                   <p>
                     Review security-related actions recorded by TrustVault.
@@ -1145,9 +1264,7 @@ function App() {
                     onClick={loadAuditLogs}
                     disabled={loadingAudit}
                   >
-                    {loadingAudit
-                      ? "Loading..."
-                      : "↻ Refresh logs"}
+                    {loadingAudit ? "Loading..." : "↻ Refresh logs"}
                   </button>
                 )}
               </section>
@@ -1176,13 +1293,13 @@ function App() {
                     </button>
                   </div>
                 </section>
-              ) : loadingAudit && auditLogs.length === 0 ? (
+              ) : loadingAudit && safeAuditLogs.length === 0 ? (
                 <section className="panel audit-panel">
                   <div className="empty-state">
                     <p>Loading audit records...</p>
                   </div>
                 </section>
-              ) : auditLogs.length === 0 ? (
+              ) : safeAuditLogs.length === 0 ? (
                 <section className="panel audit-panel">
                   <div className="empty-state">
                     <div className="empty-icon">◷</div>
@@ -1198,32 +1315,36 @@ function App() {
                     <div>
                       <h2>Recorded events</h2>
                       <p>
-                        {auditLogs.length} events returned
+                        {safeAuditLogs.length} events returned
                       </p>
                     </div>
                   </div>
 
                   <div className="audit-list">
-                    {auditLogs.map((log, index) => {
-                      const eventId = log.id ?? index;
+                    {safeAuditLogs.map((log, index) => {
                       const action = log.action || "Activity";
                       const actor =
                         log.actorName ||
                         log.actorEmail ||
                         log.actorId ||
+                        log.actor_id ||
                         "Unknown user";
                       const target =
                         log.documentName ||
                         log.documentId ||
+                        log.document_id ||
                         "—";
-                      const timestamp = log.createdAt
-                        ? new Date(log.createdAt)
+                      const rawTimestamp =
+                        log.createdAt ?? log.created_at;
+                      const timestamp = rawTimestamp
+                        ? new Date(rawTimestamp)
                         : null;
                       const validDate =
                         timestamp &&
                         !Number.isNaN(timestamp.getTime());
 
-                      let details = log.details;
+                      let details =
+                        log.details ?? log.details_json;
 
                       if (typeof details === "string") {
                         try {
@@ -1236,7 +1357,7 @@ function App() {
                       return (
                         <article
                           className="document-row audit-row"
-                          key={eventId}
+                          key={log.id ?? index}
                         >
                           <div className="stat-icon purple audit-event-icon">
                             ◷
@@ -1270,10 +1391,10 @@ function App() {
                                 </p>
                               )}
 
-                            {log.eventHash && (
+                            {(log.eventHash || log.event_hash) && (
                               <p className="audit-hash">
                                 <strong>Event hash:</strong>{" "}
-                                {log.eventHash}
+                                {log.eventHash || log.event_hash}
                               </p>
                             )}
                           </div>
@@ -1311,7 +1432,9 @@ function DocumentList({
   onRename,
   onDelete,
 }) {
-  if (!documents.length) {
+  const safeDocuments = Array.isArray(documents) ? documents : [];
+
+  if (safeDocuments.length === 0) {
     return (
       <div className="empty-state">
         <div className="empty-icon">▤</div>
@@ -1323,34 +1446,31 @@ function DocumentList({
 
   return (
     <div className="document-list">
-      {documents.map((document) => {
+      {safeDocuments.map((document) => {
         const canManage =
-          user.role === "owner" ||
-          user.role === "admin" ||
-          String(document.owner_id) === String(user.id);
+          String(user?.role || "").toLowerCase() === "owner" ||
+          String(user?.role || "").toLowerCase() === "admin" ||
+          String(document.owner_id ?? document.ownerId) ===
+            String(user?.id);
 
         const extension =
           document.name?.split(".").pop()?.toUpperCase() || "FILE";
 
         return (
           <article className="document-row" key={document.id}>
-            <div
-              className={`file-icon ${
-                extension === "PDF" ? "pdf" : ""
-              }`}
-            >
+            <div className={`file-icon ${extension === "PDF" ? "pdf" : ""}`}>
               {extension.length <= 4 ? extension : "FILE"}
             </div>
 
             <div className="document-info">
-              <h3>{document.name}</h3>
+              <h3>{document.name || "Untitled document"}</h3>
               <p>
                 <span className="category-chip">
                   {document.category || "General"}
                 </span>
                 <span className="document-dot">·</span>
                 {document.size != null
-                  ? `${(document.size / 1024).toFixed(1)} KB`
+                  ? `${(Number(document.size) / 1024).toFixed(1)} KB`
                   : "Size unavailable"}
               </p>
             </div>
@@ -1370,16 +1490,17 @@ function DocumentList({
                     type="button"
                     className="icon-button"
                     title="Rename document"
-                    aria-label={`Rename ${document.name}`}
+                    aria-label={`Rename ${document.name || "document"}`}
                     onClick={() => onRename(document)}
                   >
                     ✎
                   </button>
+
                   <button
                     type="button"
                     className="icon-button delete-icon"
                     title="Delete document"
-                    aria-label={`Delete ${document.name}`}
+                    aria-label={`Delete ${document.name || "document"}`}
                     onClick={() => onDelete(document)}
                   >
                     ×
@@ -1395,3 +1516,5 @@ function DocumentList({
 }
 
 export default App;
+
+

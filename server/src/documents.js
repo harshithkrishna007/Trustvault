@@ -1,17 +1,37 @@
 
 import express from "express";
 import multer from "multer";
-import path from "node:path";
-import fs from "node:fs";
 import { randomUUID, createHash } from "node:crypto";
-import { db, STORAGE_DIR } from "./db.js";
+import { createClient } from "@supabase/supabase-js";
+import { pool } from "./postgres.js";
 import { audit, getDocumentAccess } from "./security.js";
 
 const router = express.Router();
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
-const uploadDir = path.join(STORAGE_DIR, "files");
-fs.mkdirSync(uploadDir, { recursive: true });
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const BUCKET = "trustvault-documents";
+
+const allowedTypes = new Set([
+  "application/pdf",
+  "text/plain",
+  "image/png",
+  "image/jpeg"
+]);
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured.");
+}
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  }
+);
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -20,546 +40,524 @@ const upload = multer({
 
 function requireUser(req, res, next) {
   if (!req.session?.userId) {
-    return res.status(401).json({
-      error: "Authentication required."
-    });
+    return res.status(401).json({ error: "Authentication required." });
   }
-
-  const user = db.prepare(`
-    SELECT id, role, disabled FROM users WHERE id = ?
-  `).get(req.session.userId);
-
-  if (!user || user.disabled) {
-    return res.status(401).json({
-      error: "Authentication required."
-    });
-  }
-
-  req.user = user;
   next();
 }
 
-function requireDocumentAccess(permission = "read") {
-  return (req, res, next) => {
-    const doc = getDocumentAccess(req.user.id, req.params.id);
+async function getActiveUser(userId) {
+  const result = await pool.query(
+    `SELECT id, name, email, role, disabled
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
 
-    if (!doc) {
-      audit({
-        actorId: req.user.id,
-        action: "document_access",
-        documentId: req.params.id,
-        outcome: "denied"
-      });
-
-      return res.status(404).json({
-        error: "Document not found."
-      });
-    }
-
-    if (
-      permission === "edit" &&
-      !["owner", "admin", "edit"].includes(doc.access_level)
-    ) {
-      audit({
-        actorId: req.user.id,
-        action: "document_edit",
-        documentId: req.params.id,
-        outcome: "denied"
-      });
-
-      return res.status(403).json({
-        error: "Edit permission required."
-      });
-    }
-
-    req.document = doc;
-    next();
-  };
+  const user = result.rows[0];
+  return user && !user.disabled ? user : null;
 }
 
-// List documents the signed-in user is allowed to see.
-router.get("/", requireUser, (req, res) => {
-  const documents = db.prepare(`
-    SELECT DISTINCT
-      d.id,
-      d.name,
-      d.category,
-      d.owner_id,
-      d.mime_type,
-      d.size,
-      d.created_at,
-      d.updated_at
-    FROM documents d
-    LEFT JOIN grants g ON g.document_id = d.id
-    WHERE d.deleted_at IS NULL
-      AND (
-        d.owner_id = ?
-        OR g.user_id = ?
-        OR ? = 'admin'
-      )
-    ORDER BY d.created_at DESC
-  `).all(req.user.id, req.user.id, req.user.role);
+async function requireDocumentAccess(req, res, documentId) {
+  const access = await getDocumentAccess(req.session.userId, documentId);
 
-  res.json({ documents });
-});
-
-// Upload a document.
-router.post(
-  "/",
-  requireUser,
-  (req, res, next) => {
-    upload.single("file")(req, res, (err) => {
-      if (err) {
-        return res.status(400).json({
-          error: "Upload failed or file too large."
-        });
-      }
-
-      next();
+  if (!access) {
+    await audit({
+      actorId: req.session.userId,
+      action: "document_access",
+      documentId,
+      outcome: "denied",
+      details: { reason: "Document unavailable or access denied" }
     });
-  },
-  (req, res) => {
-    if (!["owner", "admin"].includes(req.user.role)) {
-      if (req.file) {
-        audit({
-          actorId: req.user.id,
-          action: "upload",
-          outcome: "denied"
-        });
-      }
 
-      return res.status(403).json({
-        error: "Upload not permitted."
-      });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({
-        error: "A file is required."
-      });
-    }
-
-    const name = String(
-      req.body.name || req.file.originalname
-    ).trim();
-
-    const category = String(
-      req.body.category || "General"
-    ).trim();
-
-    if (
-      !name ||
-      name.length > 180 ||
-      !category ||
-      category.length > 80
-    ) {
-      return res.status(400).json({
-        error: "Invalid name or category."
-      });
-    }
-
-    const allowedTypes = new Set([
-      "application/pdf",
-      "text/plain",
-      "image/png",
-      "image/jpeg"
-    ]);
-
-    if (!allowedTypes.has(req.file.mimetype)) {
-      return res.status(400).json({
-        error: "Unsupported file type."
-      });
-    }
-
-    const id = randomUUID();
-    const storageKey = randomUUID();
-    const filePath = path.join(uploadDir, storageKey);
-
-    const sha256 = createHash("sha256")
-      .update(req.file.buffer)
-      .digest("hex");
-
-    try {
-      fs.writeFileSync(filePath, req.file.buffer, {
-        flag: "wx"
-      });
-
-      db.prepare(`
-        INSERT INTO documents (
-          id,
-          owner_id,
-          name,
-          category,
-          mime_type,
-          size,
-          storage_key,
-          sha256
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        id,
-        req.user.id,
-        name,
-        category,
-        req.file.mimetype,
-        req.file.size,
-        storageKey,
-        sha256
-      );
-
-      audit({
-        actorId: req.user.id,
-        action: "upload",
-        documentId: id,
-        outcome: "success",
-        details: {
-          name,
-          size: req.file.size,
-          sha256
-        }
-      });
-
-      res.status(201).json({
-        documentId: id,
-        name,
-        category
-      });
-    } catch {
-      try {
-        fs.unlinkSync(filePath);
-      } catch {}
-
-      res.status(500).json({
-        error: "Could not save document."
-      });
-    }
+    res.status(404).json({ error: "Document not found or access denied." });
+    return null;
   }
-);
 
-// Download a document.
-router.get(
-  "/:id/download",
-  requireUser,
-  requireDocumentAccess("read"),
-  (req, res) => {
-    const filePath = path.join(
-      uploadDir,
-      req.document.storage_key
+  return access;
+}
+
+function canEdit(access) {
+  return ["owner", "admin", "edit"].includes(access.access_level);
+}
+
+function validText(value, maxLength) {
+  return typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.trim().length <= maxLength;
+}
+
+// List documents available to the current user.
+router.get("/", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const result = await pool.query(
+      `SELECT DISTINCT
+         d.id,
+         d.owner_id,
+         d.name,
+         d.category,
+         d.mime_type,
+         d.size,
+         d.sha256,
+         d.created_at,
+         d.updated_at,
+         u.name AS owner_name,
+         CASE
+           WHEN d.owner_id = $1 THEN 'owner'
+           WHEN $2 = 'admin' THEN 'admin'
+           ELSE g.permission
+         END AS access_level
+       FROM documents d
+       JOIN users u ON u.id = d.owner_id
+       LEFT JOIN grants g
+         ON g.document_id = d.id AND g.user_id = $1
+       WHERE d.deleted_at IS NULL
+         AND (
+           d.owner_id = $1
+           OR $2 = 'admin'
+           OR g.user_id = $1
+         )
+       ORDER BY d.created_at DESC`,
+      [user.id, user.role]
     );
 
-    if (!fs.existsSync(filePath)) {
-      audit({
-        actorId: req.user.id,
-        action: "download",
-        documentId: req.document.id,
-        outcome: "failure"
-      });
-
-      return res.status(404).json({
-        error: "Document file unavailable."
-      });
-    }
-
-    audit({
-      actorId: req.user.id,
-      action: "download",
-      documentId: req.document.id,
-      outcome: "success"
-    });
-
-    res.download(filePath, req.document.name);
+    return res.json(result.rows);
+  } catch (error) {
+    next(error);
   }
-);
-
-// Rename a document.
-router.patch(
-  "/:id",
-  requireUser,
-  requireDocumentAccess("edit"),
-  (req, res) => {
-    const name = typeof req.body.name === "string"
-      ? req.body.name.trim()
-      : "";
-
-    if (!name || name.length > 180) {
-      return res.status(400).json({
-        error: "Invalid document name."
-      });
-    }
-
-    db.prepare(`
-      UPDATE documents
-      SET name = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ? AND deleted_at IS NULL
-    `).run(name, req.document.id);
-
-    audit({
-      actorId: req.user.id,
-      action: "change",
-      documentId: req.document.id,
-      outcome: "success",
-      details: { name }
-    });
-
-    res.json({ success: true, name });
-  }
-);
-
-// Soft-delete a document. Only the owner or admin may do this.
-router.delete(
-  "/:id",
-  requireUser,
-  requireDocumentAccess("edit"),
-  (req, res) => {
-    if (
-      !["owner", "admin"].includes(
-        req.document.access_level
-      )
-    ) {
-      return res.status(403).json({
-        error: "Only the owner or admin may delete."
-      });
-    }
-
-    db.prepare(`
-      UPDATE documents
-      SET deleted_at = CURRENT_TIMESTAMP
-      WHERE id = ? AND deleted_at IS NULL
-    `).run(req.document.id);
-
-    audit({
-      actorId: req.user.id,
-      action: "delete",
-      documentId: req.document.id,
-      outcome: "success"
-    });
-
-    res.status(204).end();
-  }
-);
-
-/* List users who have access to a document.
-   Only the owner or admin may view its sharing permissions. */
-router.get("/:id/grants", requireUser, (req, res) => {
-  const document = db.prepare(`
-    SELECT id, owner_id
-    FROM documents
-    WHERE id = ? AND deleted_at IS NULL
-  `).get(req.params.id);
-
-  if (!document) {
-    return res.status(404).json({
-      error: "Document not found."
-    });
-  }
-
-  if (
-    document.owner_id !== req.user.id &&
-    req.user.role !== "admin"
-  ) {
-    return res.status(403).json({
-      error: "Only the owner or admin can view permissions."
-    });
-  }
-
-  const grants = db.prepare(`
-    SELECT
-      g.user_id AS userId,
-      u.name,
-      u.email,
-      g.permission,
-      g.granted_by AS grantedBy,
-      g.created_at AS createdAt
-    FROM grants g
-    JOIN users u ON u.id = g.user_id
-    WHERE g.document_id = ?
-      AND u.disabled = 0
-    ORDER BY g.created_at DESC
-  `).all(document.id);
-
-  res.json({ grants });
 });
 
-/* Grant or update read/edit access to a named user.
-   Only the owner or admin can manage grants. */
-router.put("/:id/grants/:userId", requireUser, (req, res) => {
-  const document = db.prepare(`
-    SELECT id, owner_id
-    FROM documents
-    WHERE id = ? AND deleted_at IS NULL
-  `).get(req.params.id);
-
-  if (!document) {
-    audit({
-      actorId: req.user.id,
-      action: "grant_permission",
-      documentId: req.params.id,
-      targetUserId: req.params.userId,
-      outcome: "denied"
-    });
-
-    return res.status(404).json({
-      error: "Document not found."
-    });
-  }
-
-  if (
-    document.owner_id !== req.user.id &&
-    req.user.role !== "admin"
-  ) {
-    audit({
-      actorId: req.user.id,
-      action: "grant_permission",
-      documentId: document.id,
-      targetUserId: req.params.userId,
-      outcome: "denied"
-    });
-
-    return res.status(403).json({
-      error: "Only the owner or admin can manage permissions."
-    });
-  }
-
-  const permission = req.body?.permission;
-
-  if (!["read", "edit"].includes(permission)) {
-    return res.status(400).json({
-      error: "Permission must be read or edit."
-    });
-  }
-
-  const target = db.prepare(`
-    SELECT id, role, disabled
-    FROM users
-    WHERE id = ?
-  `).get(req.params.userId);
-
-  if (
-    !target ||
-    target.disabled ||
-    target.id === document.owner_id
-  ) {
-    return res.status(400).json({
-      error: "Invalid target user."
-    });
-  }
+// Upload a document to private Supabase Storage.
+router.post("/", requireUser, upload.single("file"), async (req, res, next) => {
+  let storageKey;
 
   try {
-    db.transaction(() => {
-      db.prepare(`
-        INSERT INTO grants (
-          document_id,
-          user_id,
-          permission,
-          granted_by
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(document_id, user_id)
-        DO UPDATE SET
-          permission = excluded.permission,
-          granted_by = excluded.granted_by,
-          created_at = CURRENT_TIMESTAMP
-      `).run(
-        document.id,
-        target.id,
-        permission,
-        req.user.id
-      );
+    const user = await getActiveUser(req.session.userId);
 
-      audit({
-        actorId: req.user.id,
-        action: "grant_permission",
-        documentId: document.id,
-        targetUserId: target.id,
-        outcome: "success",
-        details: { permission }
-      });
-    })();
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
 
-    res.json({
-      success: true,
-      documentId: document.id,
-      userId: target.id,
-      permission
-    });
-  } catch {
-    res.status(500).json({
-      error: "Could not update permission."
-    });
-  }
-});
+    if (!["owner", "admin"].includes(user.role)) {
+      return res.status(403).json({ error: "You cannot upload documents." });
+    }
 
-/* Revoke a user's access for subsequent requests. */
-router.delete(
-  "/:id/grants/:userId",
-  requireUser,
-  (req, res) => {
-    const document = db.prepare(`
-      SELECT id, owner_id
-      FROM documents
-      WHERE id = ? AND deleted_at IS NULL
-    `).get(req.params.id);
+    const file = req.file;
+    const { name, category } = req.body;
 
-    if (!document) {
-      audit({
-        actorId: req.user.id,
-        action: "revoke_permission",
-        documentId: req.params.id,
-        targetUserId: req.params.userId,
-        outcome: "denied"
-      });
+    if (!file) {
+      return res.status(400).json({ error: "Please select a file." });
+    }
 
-      return res.status(404).json({
-        error: "Document not found."
+    if (!allowedTypes.has(file.mimetype)) {
+      return res.status(400).json({
+        error: "Only PDF, TXT, PNG, and JPEG files are allowed."
       });
     }
 
-    if (
-      document.owner_id !== req.user.id &&
-      req.user.role !== "admin"
-    ) {
-      audit({
-        actorId: req.user.id,
-        action: "revoke_permission",
-        documentId: document.id,
-        targetUserId: req.params.userId,
-        outcome: "denied"
+    if (!validText(name, 150) || !validText(category, 80)) {
+      return res.status(400).json({
+        error: "Name is required (max 150 characters) and category is required (max 80 characters)."
+      });
+    }
+
+    const documentId = randomUUID();
+    storageKey = `${user.id}/${documentId}/${randomUUID()}`;
+    const sha256 = createHash("sha256").update(file.buffer).digest("hex");
+
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET)
+      .upload(storageKey, file.buffer, {
+        contentType: file.mimetype,
+        upsert: false
       });
 
-      return res.status(403).json({
-        error: "Only the owner or admin can manage permissions."
-      });
+    if (uploadError) {
+      throw uploadError;
     }
 
     try {
-      db.transaction(() => {
-        const result = db.prepare(`
-          DELETE FROM grants
-          WHERE document_id = ? AND user_id = ?
-        `).run(document.id, req.params.userId);
+      const result = await pool.query(
+        `INSERT INTO documents (
+           id, owner_id, name, category, mime_type, size,
+           storage_key, sha256
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING
+           id, owner_id, name, category, mime_type, size,
+           sha256, created_at, updated_at`,
+        [
+          documentId,
+          user.id,
+          name.trim(),
+          category.trim(),
+          file.mimetype,
+          file.size,
+          storageKey,
+          sha256
+        ]
+      );
 
-        audit({
-          actorId: req.user.id,
-          action: "revoke_permission",
-          documentId: document.id,
-          targetUserId: req.params.userId,
-          outcome: "success",
-          details: {
-            removed: result.changes > 0
-          }
-        });
-      })();
+      await audit({
+        actorId: user.id,
+        action: "document_upload",
+        documentId,
+        outcome: "success",
+        details: { name: name.trim(), size: file.size }
+      });
 
-      res.json({
-        success: true,
-        revoked: true
-      });
-    } catch {
-      res.status(500).json({
-        error: "Could not revoke permission."
-      });
+      return res.status(201).json(result.rows[0]);
+    } catch (error) {
+      // Avoid leaving an unreferenced object if metadata creation fails.
+      const { error: cleanupError } = await supabase.storage
+        .from(BUCKET)
+        .remove([storageKey]);
+
+      if (cleanupError) {
+        console.error("Storage cleanup failed:", cleanupError.message);
+      }
+
+      throw error;
     }
+  } catch (error) {
+    next(error);
   }
-);
+});
+
+// Download a document after checking permissions.
+router.get("/:id/download", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .download(access.storage_key);
+
+    if (error || !data) {
+      await audit({
+        actorId: user.id,
+        action: "document_download",
+        documentId: access.id,
+        outcome: "failure",
+        details: { reason: "Storage download failed" }
+      });
+
+      return res.status(502).json({ error: "Unable to retrieve document." });
+    }
+
+    const buffer = Buffer.from(await data.arrayBuffer());
+
+    await audit({
+      actorId: user.id,
+      action: "document_download",
+      documentId: access.id,
+      outcome: "success"
+    });
+
+    res.setHeader("Content-Type", access.mime_type);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="document-${access.id}"`
+    );
+    res.setHeader("Content-Length", buffer.length);
+
+    return res.send(buffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Rename a document.
+router.patch("/:id", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    if (!canEdit(access)) {
+      await audit({
+        actorId: user.id,
+        action: "document_rename",
+        documentId: access.id,
+        outcome: "denied"
+      });
+      return res.status(403).json({ error: "Edit permission required." });
+    }
+
+    const { name, category } = req.body;
+    const updates = [];
+    const values = [];
+    let index = 1;
+
+    if (name !== undefined) {
+      if (!validText(name, 150)) {
+        return res.status(400).json({ error: "Invalid document name." });
+      }
+      updates.push(`name = $${index++}`);
+      values.push(name.trim());
+    }
+
+    if (category !== undefined) {
+      if (!validText(category, 80)) {
+        return res.status(400).json({ error: "Invalid category." });
+      }
+      updates.push(`category = $${index++}`);
+      values.push(category.trim());
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No valid changes provided." });
+    }
+
+    updates.push("updated_at = CURRENT_TIMESTAMP");
+    values.push(access.id);
+
+    const result = await pool.query(
+      `UPDATE documents
+       SET ${updates.join(", ")}
+       WHERE id = $${index} AND deleted_at IS NULL
+       RETURNING id, name, category, updated_at`,
+      values
+    );
+
+    await audit({
+      actorId: user.id,
+      action: "document_update",
+      documentId: access.id,
+      outcome: "success",
+      details: { changedFields: Object.keys(req.body).filter(
+        key => ["name", "category"].includes(key)
+      ) }
+    });
+
+    return res.json(result.rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Soft-delete a document; the stored file is retained for recovery.
+router.delete("/:id", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    if (!canEdit(access)) {
+      await audit({
+        actorId: user.id,
+        action: "document_delete",
+        documentId: access.id,
+        outcome: "denied"
+      });
+      return res.status(403).json({ error: "Delete permission denied." });
+    }
+
+    await pool.query(
+      `UPDATE documents
+       SET deleted_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [access.id]
+    );
+
+    await audit({
+      actorId: user.id,
+      action: "document_delete",
+      documentId: access.id,
+      outcome: "success"
+    });
+
+    return res.json({ message: "Document deleted successfully." });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// List grants for a document.
+router.get("/:id/grants", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    if (!canEdit(access)) {
+      return res.status(403).json({ error: "Permission to manage grants denied." });
+    }
+
+    const result = await pool.query(
+      `SELECT g.document_id, g.user_id, g.permission,
+              g.granted_by, g.created_at,
+              u.name, u.email
+       FROM grants g
+       JOIN users u ON u.id = g.user_id
+       WHERE g.document_id = $1
+       ORDER BY u.name`,
+      [access.id]
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Create or update a user's read/edit grant.
+router.put("/:id/grants/:userId", requireUser, async (req, res, next) => {
+  const client = await pool.connect();
+
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    if (!canEdit(access)) {
+      return res.status(403).json({ error: "Permission to manage grants denied." });
+    }
+
+    const { permission } = req.body;
+
+    if (!["read", "edit"].includes(permission)) {
+      return res.status(400).json({ error: "Permission must be read or edit." });
+    }
+
+    if (req.params.userId === access.owner_id) {
+      return res.status(400).json({ error: "The document owner already has access." });
+    }
+
+    const targetResult = await client.query(
+      `SELECT id, role, disabled
+       FROM users
+       WHERE id = $1`,
+      [req.params.userId]
+    );
+
+    const target = targetResult.rows[0];
+
+    if (!target || target.disabled) {
+      return res.status(404).json({ error: "Target user not found." });
+    }
+
+    await client.query("BEGIN");
+
+    const result = await client.query(
+      `INSERT INTO grants (document_id, user_id, permission, granted_by)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (document_id, user_id)
+       DO UPDATE SET permission = EXCLUDED.permission,
+                     granted_by = EXCLUDED.granted_by,
+                     created_at = CURRENT_TIMESTAMP
+       RETURNING document_id, user_id, permission, granted_by, created_at`,
+      [access.id, target.id, permission, user.id]
+    );
+
+    await client.query("COMMIT");
+
+    await audit({
+      actorId: user.id,
+      action: "grant_upsert",
+      documentId: access.id,
+      targetUserId: target.id,
+      outcome: "success",
+      details: { permission }
+    });
+
+    return res.json(result.rows[0]);
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Transaction may already have been committed.
+    }
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
+// Revoke a user's grant.
+router.delete("/:id/grants/:userId", requireUser, async (req, res, next) => {
+  try {
+    const user = await getActiveUser(req.session.userId);
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    const access = await requireDocumentAccess(req, res, req.params.id);
+    if (!access) return;
+
+    if (!canEdit(access)) {
+      return res.status(403).json({ error: "Permission to manage grants denied." });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM grants
+       WHERE document_id = $1 AND user_id = $2
+       RETURNING user_id`,
+      [access.id, req.params.userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Grant not found." });
+    }
+
+    await audit({
+      actorId: user.id,
+      action: "grant_revoke",
+      documentId: access.id,
+      targetUserId: req.params.userId,
+      outcome: "success"
+    });
+
+    return res.json({ message: "Access revoked successfully." });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    const message = error.code === "LIMIT_FILE_SIZE"
+      ? "File exceeds the 10 MB limit."
+      : "File upload failed.";
+    return res.status(400).json({ error: message });
+  }
+
+  next(error);
+});
 
 export default router;
