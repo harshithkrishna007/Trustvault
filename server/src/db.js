@@ -10,7 +10,9 @@ const storageDir = path.join(serverDir, "storage");
 
 fs.mkdirSync(storageDir, { recursive: true });
 
-const dbPath = process.env.DB_PATH || path.join(storageDir, "trustvault.db");
+const dbPath =
+  process.env.DB_PATH || path.join(storageDir, "trustvault.db");
+
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 export const db = new Database(dbPath);
@@ -63,7 +65,8 @@ db.exec(`
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     previous_hash TEXT,
-    event_hash TEXT NOT NULL
+    event_hash TEXT NOT NULL,
+    event_payload TEXT
   );
 
   CREATE TABLE IF NOT EXISTS audit_heads (
@@ -73,12 +76,24 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_documents_owner
     ON documents(owner_id);
+
   CREATE INDEX IF NOT EXISTS idx_grants_user
     ON grants(user_id);
+
   CREATE INDEX IF NOT EXISTS idx_audit_document
     ON audit_events(document_id);
+
   CREATE INDEX IF NOT EXISTS idx_audit_actor
     ON audit_events(actor_id);
 `);
+
+// Migration: add event_payload to databases created with the older schema.
+const auditColumns = db
+  .prepare("PRAGMA table_info(audit_events)")
+  .all();
+
+if (!auditColumns.some((column) => column.name === "event_payload")) {
+  db.exec("ALTER TABLE audit_events ADD COLUMN event_payload TEXT");
+}
 
 export const STORAGE_DIR = storageDir;

@@ -39,3 +39,5 @@ test-document.txt
 
 # Local databases and uploaded content
 server/storage/
+# Audit verification test downloads
+server/audit-download-test*.txt
